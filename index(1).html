@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Les Étoiles du Paradis — Gestion scolaire</title>
+<meta name="theme-color" content="#1B4332" />
+</head>
+<body style="margin:0">
+<div id="root"></div>
+<div id="debug" style="font-family:monospace;font-size:13px;color:#8B2E2E;padding:16px;white-space:pre-wrap;"></div>
+<script>
+  window.onerror = function (msg, src, line, col, err) {
+    document.getElementById("debug").textContent = "ERREUR : " + msg + " (ligne " + line + ", colonne " + col + ")\n" + (err && err.stack ? err.stack : "(pas de détail disponible)");
+  };
+</script>
+<script crossorigin="anonymous" src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script crossorigin="anonymous" src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script crossorigin="anonymous" src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+
+/* ============================================================
+   CONNEXION SUPABASE — projet Les Étoiles du Paradis
+   ============================================================ */
+const SUPABASE_URL = "https://xncdrketvqjsboimckxn.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_a5sPI2qGBzkjnwdn5i5OFg_gCv4iLuG";
+
+async function authLogin(email, password) {
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) { const errBody = await res.json().catch(() => ({})); throw new Error("Connexion refusée par Supabase : " + (errBody.error_description || errBody.msg || errBody.error || res.status)); }
+  return res.json();
+}
+
+async function api(path, { method = "GET", body, token, prefer } = {}) {
+  const headers = { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` };
+  if (prefer) headers["Prefer"] = prefer;
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  if (!res.ok) throw new Error(await res.text());
+  return res.status === 204 ? null : res.json();
+}
+const get = (path, token) => api(path, { token });
+const post = (path, body, token, prefer = "return=representation") => api(path, { method: "POST", body, token, prefer });
+const patch = (path, body, token, prefer = "return=representation") => api(path, { method: "PATCH", body, token, prefer });
+
+/* ============================================================
+   PALETTE
+   ============================================================ */
+const C = { ink: "#241F1A", paper: "#F3ECDC", forest: "#1B4332", forestDeep: "#12301F", amber: "#C97B1F", amberLight: "#E8A94C", red: "#8B2E2E", greenLight: "#E3EFE6", line: "#D8CDAE" };
+const money = (n) => new Intl.NumberFormat("fr-FR").format(Math.round(n || 0)) + " F";
+const today = () => new Date().toISOString().slice(0, 10);
+const fmtDate = (d) => (d ? new Date(d).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "numeric" }) : "—");
+const nextSchoolYear = (y) => { const [a, b] = y.split("-").map(Number); return `${a + 1}-${b + 1}`; };
+
+const DEFAULT_CLASSES = ["Maternelle 1", "Maternelle 2", "Maternelle 3", "CI", "CP", "CE1", "CE2", "CM1", "CM2", "6ème", "5ème", "4ème", "3ème"];
+const TRANCHES = ["Inscription", "1ère tranche", "2ème tranche", "3ème tranche", "Frais annexes"];
+const STATUTS = [{ id: "inscrit", label: "Inscrit" }, { id: "redouble", label: "Redouble" }, { id: "sorti", label: "Sorti / parti" }];
+const STAFF_ROLES = ["Enseignant", "Surveillant général", "Secrétaire", "Comptable", "Directeur des études", "Personnel d'appui"];
+const MATIERES = ["Français", "Anglais", "Mathématiques", "SVT", "Physique-Chimie", "Histoire-Géographie", "EPS", "Informatique", "Arts plastiques", "Musique", "Éducation civique", "Philosophie"];
+const ROLE_LABELS = { directeur: "Directeur", comptable: "Comptable", surveillant_general: "Surveillant général", secretaire: "Secrétaire", enseignant: "Enseignant", parent: "Parent" };
+
+/* ============================================================
+   UI PRIMITIVES (inchangées)
+   ============================================================ */
+function Seal({ paid }) {
+  return <div style={{ width: 44, height: 44, borderRadius: "50%", border: `2.5px solid ${paid ? C.forest : C.red}`, display: "flex", alignItems: "center", justifyContent: "center", transform: "rotate(-8deg)", flexShrink: 0, color: paid ? C.forest : C.red, fontFamily: "ui-serif, Georgia, serif", fontSize: 8.5, fontWeight: 700, letterSpacing: 0.4, textAlign: "center", lineHeight: 1.1, opacity: 0.85 }}>{paid ? "SOLDÉ" : "EN\nCOURS"}</div>;
+}
+function Avatar({ photo, name }) {
+  const initials = name.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase();
+  if (photo) return <img src={photo} alt={name} style={{ width: 44, height: 44, borderRadius: "50%", objectFit: "cover", flexShrink: 0, border: `2px solid ${C.line}` }} />;
+  return <div style={{ width: 44, height: 44, borderRadius: "50%", background: C.greenLight, color: C.forest, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 14, flexShrink: 0, fontFamily: "ui-serif, Georgia, serif" }}>{initials}</div>;
+}
+function Stat({ label, value, tone = "ink", small }) {
+  const color = tone === "amber" ? C.amber : tone === "red" ? C.red : tone === "forest" ? C.forest : C.ink;
+  return <div style={{ padding: "14px 16px", background: "#fff", borderRadius: 12, border: `1px solid ${C.line}`, flex: 1, minWidth: 0 }}><div style={{ fontSize: 11, color: "#8a7f68", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 6 }}>{label}</div><div style={{ fontSize: small ? 18 : 22, fontWeight: 800, color, fontFamily: "ui-serif, Georgia, serif" }}>{value}</div></div>;
+}
+function Field({ label, children }) {
+  return <label style={{ display: "block", marginBottom: 12 }}><div style={{ fontSize: 12, fontWeight: 600, color: "#5c5340", marginBottom: 5 }}>{label}</div>{children}</label>;
+}
+const inputStyle = { width: "100%", padding: "10px 12px", borderRadius: 9, border: `1.5px solid ${C.line}`, fontSize: 15, background: "#fff", color: C.ink, boxSizing: "border-box", fontFamily: "inherit" };
+function Button({ children, onClick, variant = "primary", full, disabled, type = "button" }) {
+  const styles = { primary: { background: C.forest, color: "#fff", border: "none" }, amber: { background: C.amber, color: "#fff", border: "none" }, ghost: { background: "transparent", color: C.forest, border: `1.5px solid ${C.forest}` }, danger: { background: "transparent", color: C.red, border: `1.5px solid ${C.red}` } };
+  return <button type={type} disabled={disabled} onClick={onClick} style={{ ...styles[variant], padding: "11px 18px", borderRadius: 10, fontSize: 14.5, fontWeight: 700, cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.5 : 1, width: full ? "100%" : "auto", fontFamily: "inherit" }}>{children}</button>;
+}
+function SectionTitle({ eyebrow, title, right }) {
+  return <div style={{ marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}><div>{eyebrow && <div style={{ fontSize: 11, fontWeight: 700, color: C.amber, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 3 }}>{eyebrow}</div>}<div style={{ fontSize: 19, fontWeight: 800, fontFamily: "ui-serif, Georgia, serif", color: C.ink }}>{title}</div></div>{right}</div>;
+}
+function EmptyNote({ text }) { return <div style={{ textAlign: "center", padding: "26px 16px", color: "#a89d80", fontSize: 13, background: "#fff", border: `1px dashed ${C.line}`, borderRadius: 12 }}>{text}</div>; }
+function Modal({ onClose, children, title }) {
+  return <div style={{ position: "fixed", inset: 0, background: "rgba(18,48,31,0.55)", zIndex: 100, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}><div onClick={(e) => e.stopPropagation()} style={{ background: C.paper, width: "100%", maxWidth: 640, maxHeight: "90vh", overflowY: "auto", borderRadius: "18px 18px 0 0", padding: "18px 18px 28px" }}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}><div style={{ fontSize: 17, fontWeight: 800, fontFamily: "ui-serif, Georgia, serif" }}>{title}</div><button onClick={onClose} style={{ background: "none", border: "none", fontSize: 22, color: "#8a7f68", cursor: "pointer", lineHeight: 1 }}>×</button></div>{children}</div></div>;
+}
+function Chip({ active, onClick, children }) {
+  return <button type="button" onClick={onClick} style={{ padding: "6px 11px", borderRadius: 20, border: `1.5px solid ${active ? C.forest : C.line}`, background: active ? C.forest : "#fff", color: active ? "#fff" : "#5c5340", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>{children}</button>;
+}
+function InfoRow({ label, value }) {
+  return <div style={{ display: "flex", padding: "8px 0", borderBottom: `1px solid ${C.line}` }}><div style={{ width: 110, flexShrink: 0, fontSize: 12, color: "#8a7f68", fontWeight: 600 }}>{label}</div><div style={{ fontSize: 13.5, color: value ? C.ink : "#a89d80" }}>{value || "Non renseigné"}</div></div>;
+}
+function Toast({ msg, error }) { return <div style={{ position: "fixed", bottom: 90, left: "50%", transform: "translateX(-50%)", background: error ? C.red : C.forestDeep, color: "#fff", padding: "10px 18px", borderRadius: 10, fontSize: 13.5, fontWeight: 600, boxShadow: "0 4px 14px rgba(0,0,0,0.25)", zIndex: 200, maxWidth: "88vw", textAlign: "center" }}>{msg}</div>; }
+
+/* ============================================================
+   ÉCRAN DE CONNEXION
+   ============================================================ */
+function Login({ onLogin }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async () => {
+    if (!email || !password) return setError("Renseignez l'email et le mot de passe");
+    setBusy(true); setError("");
+    try { await onLogin(email, password); }
+    catch (e) { setError(e.message || "Connexion impossible"); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.forestDeep, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "ui-sans-serif, system-ui", padding: 20 }}>
+      <div style={{ maxWidth: 380, width: "100%" }}>
+        <div style={{ textAlign: "center", marginBottom: 26 }}>
+          <div style={{ width: 64, height: 64, borderRadius: "50%", border: `2.5px solid ${C.amberLight}`, margin: "0 auto 18px", display: "flex", alignItems: "center", justifyContent: "center", transform: "rotate(-6deg)" }}>
+            <span style={{ color: C.amberLight, fontFamily: "ui-serif, Georgia, serif", fontWeight: 800, fontSize: 22 }}>EP</span>
+          </div>
+          <div style={{ color: "#EFE8D4", fontSize: 12, letterSpacing: 2, textTransform: "uppercase", fontWeight: 600, marginBottom: 6 }}>Complexe Scolaire Bilingue</div>
+          <h1 style={{ color: "#fff", fontFamily: "ui-serif, Georgia, serif", fontSize: 26, margin: 0, lineHeight: 1.25 }}>Les Étoiles du Paradis</h1>
+        </div>
+        <div style={{ background: "#EFE8D4", borderRadius: 14, padding: 20 }}>
+          <Field label="Email"><input style={inputStyle} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="vous@etoilesduparadis.bj" /></Field>
+          <Field label="Mot de passe"><input style={inputStyle} type="password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && submit()} /></Field>
+          {error && <div style={{ color: C.red, fontSize: 12.5, fontWeight: 600, marginBottom: 10 }}>{error}</div>}
+          <Button full onClick={submit} disabled={busy}>{busy ? "Connexion…" : "Se connecter"}</Button>
+        </div>
+        <div style={{ color: "#B9AE8F", fontSize: 11.5, marginTop: 16, textAlign: "center", lineHeight: 1.5 }}>Connecté à la base de données définitive de l'établissement.</div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   APP
+   ============================================================ */
+function App() {
+  const [session, setSession] = useState(null); // { token, appUser }
+  const [loading, setLoading] = useState(false);
+  const [tab, setTab] = useState("dashboard");
+  const [toast, setToast] = useState(null);
+
+  const [classes, setClasses] = useState([]);
+  const [activeYear, setActiveYear] = useState("2026-2027");
+  const [students, setStudents] = useState([]);
+  const [enrollments, setEnrollments] = useState([]);
+  const [feeGrid, setFeeGrid] = useState([]); // raw rows
+  const [payments, setPayments] = useState([]);
+  const [staff, setStaff] = useState([]);
+  const [staffSubjects, setStaffSubjects] = useState([]);
+  const [staffClasses, setStaffClasses] = useState([]);
+  const [staffPayments, setStaffPayments] = useState([]);
+  const [openStudent, setOpenStudent] = useState(null);
+  const [openStaff, setOpenStaff] = useState(null);
+
+  const notify = (msg, error) => { setToast({ msg, error }); setTimeout(() => setToast(null), 2600); };
+
+  const handleLogin = async (email, password) => {
+    const auth = await authLogin(email, password);
+    const token = auth.access_token;
+    const rows = await get(`users?auth_id=eq.${auth.user.id}&select=*`, token);
+    if (!rows[0]) throw new Error("Compte non relié à un profil (voir Étape 2 du guide)");
+    const appUser = rows[0];
+    if (!appUser.active) throw new Error("Ce compte est désactivé");
+    setSession({ token, appUser });
+  };
+
+  const reloadAll = useCallback(async (token) => {
+    setLoading(true);
+    try {
+      const [cls, st, enr, fg, pay, sf, ssub, sclass, spay] = await Promise.all([
+        get("classes?select=*", token),
+        get("students?select=*", token),
+        get("enrollments?select=*", token),
+        get("fee_grid?select=*", token),
+        get("payments?select=*&order=receipt_no.desc", token),
+        get("staff?select=*", token),
+        get("staff_subjects?select=*", token),
+        get("staff_classes?select=*", token),
+        get("staff_payments?select=*", token),
+      ]);
+      setClasses(cls); setStudents(st); setEnrollments(enr); setFeeGrid(fg);
+      setPayments(pay); setStaff(sf); setStaffSubjects(ssub); setStaffClasses(sclass); setStaffPayments(spay);
+      const years = [...new Set(enr.map((e) => e.school_year))].sort();
+      if (years.length) setActiveYear(years[years.length - 1]);
+    } catch (e) {
+      notify("Erreur de chargement : " + e.message, true);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { if (session) reloadAll(session.token); }, [session, reloadAll]);
+
+  /* ---------- Helpers classes ---------- */
+  const classNameById = (id) => classes.find((c) => c.id === id)?.name || "";
+  const classesForYear = (year) =>
+    classes.filter((c) => c.school_year === year).sort((a, b) => DEFAULT_CLASSES.indexOf(a.name) - DEFAULT_CLASSES.indexOf(b.name));
+
+  const getOrCreateClass = async (name, year) => {
+    const found = classes.find((c) => c.name === name && c.school_year === year);
+    if (found) return found.id;
+    const [row] = await post("classes?on_conflict=name,school_year", { name, school_year: year }, session.token, "return=representation,resolution=merge-duplicates");
+    setClasses((prev) => [...prev, row]);
+    return row.id;
+  };
+
+  /* ---------- Données dérivées ---------- */
+  const classOf = (studentId, year = activeYear) => {
+    const e = enrollments.find((x) => x.student_id === studentId && x.school_year === year);
+    return e ? classNameById(e.class_id) : null;
+  };
+  const statusOf = (studentId, year = activeYear) => enrollments.find((x) => x.student_id === studentId && x.school_year === year)?.status || null;
+
+  const activeStudents = useMemo(
+    () => students.filter((s) => statusOf(s.id) && statusOf(s.id) !== "sorti").map((s) => ({ ...toUi(s), cls: classOf(s.id) })),
+    [students, enrollments, activeYear, classes]
+  );
+
+  const totalForClass = (clsName) => {
+    const cls = classes.find((c) => c.name === clsName && c.school_year === activeYear);
+    if (!cls) return 0;
+    return feeGrid.filter((f) => f.class_id === cls.id && f.school_year === activeYear).reduce((s, f) => s + Number(f.amount || 0), 0);
+  };
+  const activePayments = payments.filter((p) => !p.cancelled_at);
+  const paidByStudent = useMemo(() => {
+    const m = {};
+    activePayments.forEach((p) => { m[p.student_id] = (m[p.student_id] || 0) + Number(p.amount || 0); });
+    return m;
+  }, [payments]);
+
+  const studentsWithBalance = useMemo(
+    () => activeStudents.map((s) => { const due = totalForClass(s.cls); const paid = paidByStudent[s.id] || 0; return { ...s, due, paid, balance: due - paid }; }),
+    [activeStudents, feeGrid, paidByStudent]
+  );
+
+  const totals = useMemo(() => {
+    const encaisse = activePayments.reduce((s, p) => s + Number(p.amount || 0), 0);
+    const attendu = studentsWithBalance.reduce((s, st) => s + st.due, 0);
+    const enAttente = Math.max(attendu - encaisse, 0);
+    const enRetard = studentsWithBalance.filter((s) => s.balance > 0).length;
+    return { encaisse, enAttente, enRetard, effectif: activeStudents.length };
+  }, [payments, studentsWithBalance, activeStudents]);
+
+  if (!session) return <Login onLogin={handleLogin} />;
+  if (loading && students.length === 0) {
+    return <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: C.paper, fontFamily: "ui-sans-serif, system-ui" }}><div style={{ color: C.forest, fontWeight: 700 }}>Chargement des données…</div></div>;
+  }
+
+  const role = session.appUser.role;
+  const isDirecteur = role === "directeur";
+  const token = session.token;
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.paper, fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif", color: C.ink, paddingBottom: 78 }}>
+      <Header role={role} year={activeYear} name={session.appUser.name} onLogout={() => setSession(null)} />
+      <div style={{ maxWidth: 640, margin: "0 auto", padding: "16px 14px 24px" }}>
+        {tab === "dashboard" && <Dashboard totals={totals} studentsWithBalance={studentsWithBalance} />}
+        {tab === "eleves" && (
+          <Eleves
+            students={activeStudents} activeYear={activeYear} studentsWithBalance={studentsWithBalance} onOpen={setOpenStudent}
+            onAddStudent={async (profile, clsName) => {
+              try {
+                const classId = await getOrCreateClass(clsName, activeYear);
+                const [srow] = await post("students", toDb(profile), token);
+                setStudents((prev) => [...prev, srow]);
+                const [erow] = await post("enrollments", { student_id: srow.id, school_year: activeYear, class_id: classId, status: "inscrit" }, token);
+                setEnrollments((prev) => [...prev, erow]);
+                notify("Élève ajouté au registre");
+              } catch (e) { notify("Erreur : " + e.message, true); }
+            }}
+            notify={notify}
+          />
+        )}
+        {tab === "personnel" && (
+          <Personnel
+            role={role} staff={staff} staffSubjects={staffSubjects} staffClasses={staffClasses} staffPayments={staffPayments}
+            classNameById={classNameById} onOpen={setOpenStaff}
+            onAdd={async (profile) => {
+              try {
+                const { subjects, classesSel, ...rest } = profile;
+                const [srow] = await post("staff", rest, token);
+                setStaff((prev) => [...prev, srow]);
+                if (subjects.length) { const rows = await post("staff_subjects", subjects.map((subject) => ({ staff_id: srow.id, subject })), token); setStaffSubjects((p) => [...p, ...rows]); }
+                if (classesSel.length) {
+                  const ids = await Promise.all(classesSel.map((n) => getOrCreateClass(n, activeYear)));
+                  const rows = await post("staff_classes", ids.map((class_id) => ({ staff_id: srow.id, class_id })), token);
+                  setStaffClasses((p) => [...p, ...rows]);
+                }
+                notify("Fiche du personnel enregistrée");
+              } catch (e) { notify("Erreur : " + e.message, true); }
+            }}
+            notify={notify}
+          />
+        )}
+        {tab === "paiements" && (
+          <Paiements
+            role={role} students={activeStudents} studentsWithBalance={studentsWithBalance} payments={payments}
+            onPay={async (record) => {
+              try {
+                const [row] = await post("payments", { ...record, recorded_by: session.appUser.id }, token);
+                setPayments((prev) => [row, ...prev]);
+                notify(`Reçu #${String(row.receipt_no).padStart(4, "0")} enregistré`);
+              } catch (e) { notify("Erreur : " + e.message, true); }
+            }}
+            onCancel={async (id) => {
+              try {
+                const [row] = await patch(`payments?id=eq.${id}`, { cancelled_at: new Date().toISOString(), cancelled_by: session.appUser.id }, token);
+                setPayments((prev) => prev.map((p) => (p.id === id ? row : p)));
+                notify("Paiement annulé");
+              } catch (e) { notify("Erreur : " + e.message, true); }
+            }}
+            notify={notify}
+          />
+        )}
+        {tab === "grille" && (
+          <Grille
+            role={role} activeYear={activeYear} classesForYear={classesForYear} feeGrid={feeGrid}
+            onSave={async (classId, rows) => {
+              try {
+                const payload = rows.map((r) => ({ class_id: classId, school_year: activeYear, tranche_label: r.label, amount: r.amount }));
+                const saved = await post("fee_grid?on_conflict=class_id,school_year,tranche_label", payload, token, "return=representation,resolution=merge-duplicates");
+                setFeeGrid((prev) => [...prev.filter((f) => !(f.class_id === classId && f.school_year === activeYear)), ...saved]);
+                notify("Grille de frais enregistrée");
+              } catch (e) { notify("Erreur : " + e.message, true); }
+            }}
+          />
+        )}
+        {tab === "annee" && (
+          <AnneeScolaire
+            role={role} activeYear={activeYear} students={activeStudents}
+            onValidate={async (nextYear, decisions) => {
+              try {
+                for (const d of decisions) {
+                  if (d.status === "sorti") continue;
+                  const classId = await getOrCreateClass(d.cls, nextYear);
+                  const [row] = await post("enrollments", { student_id: d.studentId, school_year: nextYear, class_id: classId, status: d.status === "redouble" ? "redouble" : "inscrit" }, token);
+                  setEnrollments((prev) => [...prev, row]);
+                }
+                setActiveYear(nextYear);
+                notify(`Année ${nextYear} ouverte`);
+                setTab("dashboard");
+              } catch (e) { notify("Erreur : " + e.message, true); }
+            }}
+          />
+        )}
+      </div>
+      <TabBar tab={tab} setTab={setTab} />
+      {toast && <Toast msg={toast.msg} error={toast.error} />}
+      {openStudent && (
+        <StudentFile
+          student={toUi(students.find((s) => s.id === openStudent) || {})}
+          enrollments={enrollments.filter((e) => e.student_id === openStudent).map((e) => ({ ...e, cls: classNameById(e.class_id) })).sort((a, b) => a.school_year.localeCompare(b.school_year))}
+          payments={payments.filter((p) => p.student_id === openStudent)}
+          onClose={() => setOpenStudent(null)}
+          onUpdate={async (patchData) => {
+            try { const [row] = await patch(`students?id=eq.${openStudent}`, toDb(patchData), token); setStudents((prev) => prev.map((s) => (s.id === openStudent ? row : s))); }
+            catch (e) { notify("Erreur : " + e.message, true); }
+          }}
+        />
+      )}
+      {openStaff && (
+        <StaffFile
+          person={staff.find((s) => s.id === openStaff)}
+          subjects={staffSubjects.filter((x) => x.staff_id === openStaff).map((x) => x.subject)}
+          classesSel={staffClasses.filter((x) => x.staff_id === openStaff).map((x) => classNameById(x.class_id))}
+          role={role}
+          payments={staffPayments.filter((p) => p.staff_id === openStaff)}
+          onClose={() => setOpenStaff(null)}
+          onPay={async (record) => {
+            try { const [row] = await post("staff_payments", { ...record, staff_id: openStaff, recorded_by: session.appUser.id }, token); setStaffPayments((prev) => [...prev, row]); notify("Paiement indicatif enregistré"); }
+            catch (e) { notify("Erreur : " + e.message, true); }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------- Mapping camelCase (UI) <-> snake_case (DB) ---------- */
+function toUi(s) {
+  return { id: s.id, name: s.name, gender: s.gender, birthDate: s.birth_date, birthPlace: s.birth_place, fatherName: s.father_name, motherName: s.mother_name, address: s.address, parentContact: s.parent_contact_1, parentContact2: s.parent_contact_2, photo: s.photo_url, docs: s.docs_notes };
+}
+function toDb(s) {
+  return { name: s.name, gender: s.gender, birth_date: s.birthDate || null, birth_place: s.birthPlace, father_name: s.fatherName, mother_name: s.motherName, address: s.address, parent_contact_1: s.parentContact, parent_contact_2: s.parentContact2, photo_url: s.photo, docs_notes: s.docs };
+}
+
+/* ---------- Header / TabBar (identiques, + déconnexion) ---------- */
+function Header({ role, year, name, onLogout }) {
+  return (
+    <div style={{ background: C.forest, padding: "16px 18px", display: "flex", alignItems: "center", justifyContent: "space-between", boxShadow: "0 2px 8px rgba(0,0,0,0.15)" }}>
+      <div>
+        <div style={{ color: "#fff", fontFamily: "ui-serif, Georgia, serif", fontWeight: 700, fontSize: 16, lineHeight: 1.15 }}>{name}</div>
+        <div style={{ color: C.amberLight, fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>{ROLE_LABELS[role] || role} · Année {year}</div>
+      </div>
+      <button onClick={onLogout} style={{ background: "rgba(255,255,255,0.12)", border: "none", color: "#EFE8D4", fontSize: 12, fontWeight: 600, padding: "7px 12px", borderRadius: 8, cursor: "pointer", fontFamily: "inherit" }}>Déconnexion</button>
+    </div>
+  );
+}
+function TabBar({ tab, setTab }) {
+  const items = [{ id: "dashboard", label: "Tableau", icon: "◈" }, { id: "eleves", label: "Élèves", icon: "◔" }, { id: "personnel", label: "Personnel", icon: "☖" }, { id: "paiements", label: "Paiements", icon: "◑" }, { id: "grille", label: "Grille", icon: "▤" }, { id: "annee", label: "Année", icon: "↻" }];
+  return (
+    <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, background: "#fff", borderTop: `1px solid ${C.line}`, display: "flex", padding: "8px 4px calc(8px + env(safe-area-inset-bottom))", maxWidth: 640, margin: "0 auto", boxShadow: "0 -2px 10px rgba(0,0,0,0.06)" }}>
+      {items.map((it) => (
+        <button key={it.id} onClick={() => setTab(it.id)} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "6px 1px", color: tab === it.id ? C.forest : "#a89d80", fontWeight: tab === it.id ? 800 : 500, fontFamily: "inherit" }}>
+          <span style={{ fontSize: 17 }}>{it.icon}</span><span style={{ fontSize: 9.5 }}>{it.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Dashboard ---------- */
+function Dashboard({ totals, studentsWithBalance }) {
+  const enRetard = studentsWithBalance.filter((s) => s.balance > 0).sort((a, b) => b.balance - a.balance).slice(0, 6);
+  return (
+    <div>
+      <SectionTitle eyebrow="Aujourd'hui" title="Vue d'ensemble" />
+      <div style={{ display: "flex", gap: 10, marginBottom: 10 }}><Stat label="Encaissé" value={money(totals.encaisse)} tone="forest" /><Stat label="En attente" value={money(totals.enAttente)} tone="amber" /></div>
+      <div style={{ display: "flex", gap: 10, marginBottom: 20 }}><Stat label="Effectif" value={totals.effectif} small /><Stat label="En retard" value={totals.enRetard} tone={totals.enRetard > 0 ? "red" : "forest"} small /></div>
+      <SectionTitle title="Élèves en retard de paiement" />
+      {enRetard.length === 0 ? <EmptyNote text="Aucun retard enregistré pour le moment." /> : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {enRetard.map((s) => (
+            <div key={s.id} style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "center", gap: 12 }}>
+              <Seal paid={false} /><div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 700, fontSize: 14.5 }}>{s.name}</div><div style={{ fontSize: 12, color: "#8a7f68" }}>{s.cls}</div></div>
+              <div style={{ textAlign: "right" }}><div style={{ fontWeight: 800, color: C.red, fontSize: 14.5 }}>{money(s.balance)}</div><div style={{ fontSize: 10.5, color: "#8a7f68" }}>restant dû</div></div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- Élèves ---------- */
+function Eleves({ students, activeYear, studentsWithBalance, onOpen, onAddStudent, notify }) {
+  const [showForm, setShowForm] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [cls, setCls] = useState(DEFAULT_CLASSES[0]);
+  const [form, setForm] = useState(blank());
+  const fileRef = useRef(null);
+  function blank() { return { name: "", gender: "M", birthDate: "", birthPlace: "", fatherName: "", motherName: "", address: "", parentContact: "", parentContact2: "", photo: "", docs: "" }; }
+  const list = studentsWithBalance.filter((s) => s.name.toLowerCase().includes(filter.toLowerCase()) || (s.cls || "").toLowerCase().includes(filter.toLowerCase()));
+  const handlePhoto = (e) => {
+    const file = e.target.files?.[0]; if (!file) return;
+    if (file.size > 700_000) { notify("Photo trop lourde, choisissez-en une plus légère", true); return; }
+    const reader = new FileReader(); reader.onload = () => setForm((f) => ({ ...f, photo: reader.result })); reader.readAsDataURL(file);
+  };
+  const submit = () => { if (!form.name.trim()) return notify("Le nom de l'élève est requis", true); onAddStudent({ ...form, name: form.name.trim() }, cls); setForm(blank()); setShowForm(false); };
+  return (
+    <div>
+      <SectionTitle eyebrow={`${students.length} inscrits · ${activeYear}`} title="Dossiers des élèves" />
+      <input placeholder="Rechercher un élève ou une classe…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ ...inputStyle, marginBottom: 12 }} />
+      {!showForm ? <Button variant="amber" full onClick={() => setShowForm(true)}>+ Ouvrir un nouveau dossier</Button> : (
+        <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
+            <Avatar photo={form.photo} name={form.name || "Nouvel élève"} />
+            <button onClick={() => fileRef.current?.click()} style={{ fontSize: 12.5, fontWeight: 700, color: C.forest, background: "none", border: `1.5px solid ${C.forest}`, borderRadius: 8, padding: "7px 12px", cursor: "pointer", fontFamily: "inherit" }}>{form.photo ? "Changer la photo" : "Ajouter une photo"}</button>
+            <input ref={fileRef} type="file" accept="image/*" onChange={handlePhoto} style={{ display: "none" }} />
+          </div>
+          <Field label="Nom complet de l'élève"><input style={inputStyle} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}><Field label="Sexe"><select style={inputStyle} value={form.gender} onChange={(e) => setForm({ ...form, gender: e.target.value })}><option value="M">Masculin</option><option value="F">Féminin</option></select></Field></div>
+            <div style={{ flex: 1 }}><Field label="Classe"><select style={inputStyle} value={cls} onChange={(e) => setCls(e.target.value)}>{DEFAULT_CLASSES.map((c) => <option key={c}>{c}</option>)}</select></Field></div>
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}><Field label="Date de naissance"><input style={inputStyle} type="date" value={form.birthDate} onChange={(e) => setForm({ ...form, birthDate: e.target.value })} /></Field></div>
+            <div style={{ flex: 1 }}><Field label="Lieu de naissance"><input style={inputStyle} value={form.birthPlace} onChange={(e) => setForm({ ...form, birthPlace: e.target.value })} /></Field></div>
+          </div>
+          <Field label="Nom du père"><input style={inputStyle} value={form.fatherName} onChange={(e) => setForm({ ...form, fatherName: e.target.value })} /></Field>
+          <Field label="Nom de la mère / tuteur"><input style={inputStyle} value={form.motherName} onChange={(e) => setForm({ ...form, motherName: e.target.value })} /></Field>
+          <Field label="Adresse / quartier"><input style={inputStyle} value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} /></Field>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}><Field label="Contact parent 1"><input style={inputStyle} value={form.parentContact} onChange={(e) => setForm({ ...form, parentContact: e.target.value })} /></Field></div>
+            <div style={{ flex: 1 }}><Field label="Contact parent 2"><input style={inputStyle} value={form.parentContact2} onChange={(e) => setForm({ ...form, parentContact2: e.target.value })} /></Field></div>
+          </div>
+          <Field label="Documents fournis"><textarea style={{ ...inputStyle, minHeight: 60 }} value={form.docs} onChange={(e) => setForm({ ...form, docs: e.target.value })} /></Field>
+          <div style={{ display: "flex", gap: 8 }}><Button onClick={submit}>Enregistrer le dossier</Button><Button variant="ghost" onClick={() => { setShowForm(false); setForm(blank()); }}>Annuler</Button></div>
+        </div>
+      )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {list.map((s) => (
+          <button key={s.id} onClick={() => onOpen(s.id)} style={{ textAlign: "left", background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "center", gap: 12, cursor: "pointer", fontFamily: "inherit" }}>
+            <Avatar photo={s.photo} name={s.name} />
+            <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 700, fontSize: 14.5 }}>{s.name}</div><div style={{ fontSize: 12, color: "#8a7f68" }}>{s.cls}{s.parentContact ? ` · ${s.parentContact}` : ""}</div></div>
+            <div style={{ textAlign: "right" }}><div style={{ fontWeight: 800, fontSize: 13.5, color: s.balance > 0 ? C.red : C.forest }}>{s.balance > 0 ? money(s.balance) : "Soldé"}</div><div style={{ fontSize: 10.5, color: "#a89d80" }}>Voir le dossier ›</div></div>
+          </button>
+        ))}
+        {list.length === 0 && <EmptyNote text="Aucun élève ne correspond à votre recherche." />}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Fiche élève ---------- */
+function StudentFile({ student, enrollments, payments, onClose, onUpdate }) {
+  const [editingDocs, setEditingDocs] = useState(false);
+  const [docs, setDocs] = useState(student?.docs || "");
+  if (!student?.id) return null;
+  const totalPaid = payments.filter((p) => !p.cancelled_at).reduce((s, p) => s + Number(p.amount || 0), 0);
+  return (
+    <Modal title="Dossier de l'élève" onClose={onClose}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 18 }}>
+        <Avatar photo={student.photo} name={student.name} />
+        <div><div style={{ fontWeight: 800, fontSize: 17, fontFamily: "ui-serif, Georgia, serif" }}>{student.name}</div><div style={{ fontSize: 12.5, color: "#8a7f68" }}>{student.gender === "F" ? "Féminin" : "Masculin"} · Né(e) le {fmtDate(student.birthDate)} {student.birthPlace ? `à ${student.birthPlace}` : ""}</div></div>
+      </div>
+      <InfoRow label="Père" value={student.fatherName} /><InfoRow label="Mère / tuteur" value={student.motherName} /><InfoRow label="Adresse" value={student.address} /><InfoRow label="Contact(s)" value={[student.parentContact, student.parentContact2].filter(Boolean).join(" · ")} />
+      <div style={{ marginTop: 18, marginBottom: 8, fontSize: 13, fontWeight: 700, color: C.forest, textTransform: "uppercase" }}>Documents</div>
+      {editingDocs ? (<><textarea style={{ ...inputStyle, minHeight: 70 }} value={docs} onChange={(e) => setDocs(e.target.value)} /><div style={{ display: "flex", gap: 8, marginTop: 8 }}><Button onClick={() => { onUpdate({ ...student, docs }); setEditingDocs(false); }}>Enregistrer</Button><Button variant="ghost" onClick={() => setEditingDocs(false)}>Annuler</Button></div></>) : (
+        <div onClick={() => setEditingDocs(true)} style={{ background: "#fff", border: `1px dashed ${C.line}`, borderRadius: 10, padding: 12, fontSize: 13.5, color: student.docs ? C.ink : "#a89d80", cursor: "pointer" }}>{student.docs || "Aucune note — toucher pour ajouter"}</div>
+      )}
+      <div style={{ marginTop: 20, marginBottom: 8, fontSize: 13, fontWeight: 700, color: C.forest, textTransform: "uppercase" }}>Parcours scolaire</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {enrollments.map((e) => { const st = STATUTS.find((x) => x.id === e.status); return (
+          <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: "9px 13px" }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5 }}>{e.school_year}</div><div style={{ fontSize: 13 }}>{e.cls}</div><div style={{ fontSize: 11.5, fontWeight: 700, color: e.status === "redouble" ? C.amber : e.status === "sorti" ? C.red : C.forest }}>{st?.label || e.status}</div>
+          </div>
+        ); })}
+        {enrollments.length === 0 && <div style={{ fontSize: 12.5, color: "#a89d80" }}>Aucune inscription enregistrée.</div>}
+      </div>
+      <div style={{ marginTop: 20, marginBottom: 8, fontSize: 13, fontWeight: 700, color: C.forest, textTransform: "uppercase" }}>Paiements — total {money(totalPaid)}</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {payments.sort((a, b) => (b.receipt_no || 0) - (a.receipt_no || 0)).map((p) => (
+          <div key={p.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: "9px 13px", opacity: p.cancelled_at ? 0.5 : 1 }}>
+            <span>{p.tranche_label} · {fmtDate(p.created_at)} {p.cancelled_at ? "· annulé" : ""}</span><span style={{ fontWeight: 700, color: C.forest }}>{money(p.amount)}</span>
+          </div>
+        ))}
+        {payments.length === 0 && <div style={{ fontSize: 12.5, color: "#a89d80" }}>Aucun paiement enregistré.</div>}
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------- Paiements ---------- */
+function Paiements({ role, students, studentsWithBalance, payments, onPay, onCancel, notify }) {
+  const [studentId, setStudentId] = useState(""); const [tranche, setTranche] = useState(TRANCHES[0]); const [amount, setAmount] = useState(""); const [showForm, setShowForm] = useState(false);
+  const submit = () => { if (!studentId) return notify("Choisissez un élève", true); const amt = Number(amount); if (!amt || amt <= 0) return notify("Montant invalide", true); onPay({ student_id: studentId, tranche_label: tranche, amount: amt, payment_method: "especes" }); setAmount(""); setStudentId(""); setShowForm(false); };
+  const sorted = [...payments].sort((a, b) => (b.receipt_no || 0) - (a.receipt_no || 0));
+  const studentName = (id) => students.find((s) => s.id === id)?.name || "Élève inconnu";
+  const studentClass = (id) => students.find((s) => s.id === id)?.cls || "";
+  return (
+    <div>
+      <SectionTitle title="Paiements" />
+      {!showForm ? <Button variant="amber" full onClick={() => setShowForm(true)}>+ Enregistrer un paiement</Button> : (
+        <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+          <Field label="Élève"><select style={inputStyle} value={studentId} onChange={(e) => setStudentId(e.target.value)}><option value="">— Choisir —</option>{studentsWithBalance.map((s) => <option key={s.id} value={s.id}>{s.name} · {s.cls} {s.balance > 0 ? `(reste ${money(s.balance)})` : "(soldé)"}</option>)}</select></Field>
+          <Field label="Type de versement"><select style={inputStyle} value={tranche} onChange={(e) => setTranche(e.target.value)}>{TRANCHES.map((t) => <option key={t}>{t}</option>)}</select></Field>
+          <Field label="Montant versé (FCFA)"><input style={inputStyle} type="number" value={amount} onChange={(e) => setAmount(e.target.value)} /></Field>
+          <div style={{ display: "flex", gap: 8 }}><Button onClick={submit}>Encaisser & générer le reçu</Button><Button variant="ghost" onClick={() => setShowForm(false)}>Annuler</Button></div>
+        </div>
+      )}
+      <SectionTitle title="Historique des reçus" />
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {sorted.map((p) => (
+          <div key={p.id} style={{ background: "#fff", border: `1px dashed ${C.line}`, borderRadius: 12, padding: "12px 14px", opacity: p.cancelled_at ? 0.55 : 1 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div><div style={{ fontWeight: 700, fontSize: 14 }}>{studentName(p.student_id)}</div><div style={{ fontSize: 11.5, color: "#8a7f68" }}>{studentClass(p.student_id)} · {p.tranche_label} · {fmtDate(p.created_at)}{p.cancelled_at ? " · ANNULÉ" : ""}</div></div>
+              <div style={{ textAlign: "right" }}><div style={{ fontWeight: 800, color: C.forest, fontSize: 14.5 }}>{money(p.amount)}</div><div style={{ fontSize: 10.5, color: "#a89d80" }}>Reçu #{String(p.receipt_no).padStart(4, "0")}</div></div>
+            </div>
+            {role === "directeur" && !p.cancelled_at && <button onClick={() => { if (confirm("Annuler ce paiement ?")) onCancel(p.id); }} style={{ marginTop: 8, background: "none", border: "none", color: C.red, fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", padding: 0 }}>Annuler ce paiement</button>}
+          </div>
+        ))}
+        {sorted.length === 0 && <EmptyNote text="Aucun paiement enregistré pour le moment." />}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Grille de frais ---------- */
+function Grille({ role, activeYear, classesForYear, feeGrid, onSave }) {
+  const [cls, setCls] = useState(DEFAULT_CLASSES[0]);
+  const [local, setLocal] = useState({});
+  const classRow = classesForYear(activeYear).find((c) => c.name === cls);
+  useEffect(() => {
+    if (!classRow) { setLocal({}); return; }
+    const rows = feeGrid.filter((f) => f.class_id === classRow.id && f.school_year === activeYear);
+    const obj = {}; TRANCHES.forEach((t) => { obj[t] = rows.find((r) => r.tranche_label === t)?.amount || ""; }); setLocal(obj);
+  }, [cls, feeGrid, classRow]);
+  const total = TRANCHES.reduce((s, t) => s + (Number(local[t]) || 0), 0);
+  return (
+    <div>
+      <SectionTitle eyebrow="Par classe" title="Grille des frais" />
+      {role !== "directeur" && <div style={{ background: C.greenLight, border: `1px solid ${C.forest}22`, borderRadius: 10, padding: "10px 14px", fontSize: 12.5, color: C.forest, marginBottom: 14 }}>Seul le Directeur peut modifier la grille. Vous pouvez la consulter.</div>}
+      <Field label="Classe"><select style={inputStyle} value={cls} onChange={(e) => setCls(e.target.value)}>{DEFAULT_CLASSES.map((c) => <option key={c}>{c}</option>)}</select></Field>
+      <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: 16, marginBottom: 14 }}>
+        {TRANCHES.map((t) => (<Field key={t} label={t}><input style={inputStyle} type="number" disabled={role !== "directeur"} value={local[t] || ""} onChange={(e) => setLocal((prev) => ({ ...prev, [t]: e.target.value }))} placeholder="0" /></Field>))}
+        <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12, display: "flex", justifyContent: "space-between", fontWeight: 800 }}><span>Total annuel</span><span style={{ color: C.forest }}>{money(total)}</span></div>
+      </div>
+      {role === "directeur" && <Button full onClick={async () => { const classId = await classRow?.id; onSave(classId, TRANCHES.map((label) => ({ label, amount: Number(local[label]) || 0 }))); }}>Enregistrer la grille</Button>}
+    </div>
+  );
+}
+
+/* ---------- Année scolaire ---------- */
+function AnneeScolaire({ role, activeYear, students, onValidate }) {
+  const nextYear = nextSchoolYear(activeYear);
+  const [decisions, setDecisions] = useState(() => students.map((s) => ({ studentId: s.id, name: s.name, currentCls: s.cls, cls: s.cls, status: "inscrit" })));
+  if (role !== "directeur") return (<div><SectionTitle title="Année scolaire" /><EmptyNote text="Seul le Directeur peut ouvrir une nouvelle année scolaire." /></div>);
+  const update = (id, field, val) => setDecisions((prev) => prev.map((d) => (d.studentId === id ? { ...d, [field]: val } : d)));
+  return (
+    <div>
+      <SectionTitle eyebrow={`Année en cours : ${activeYear}`} title={`Passage à ${nextYear}`} />
+      <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: 14, fontSize: 12.5, color: "#5c5340", marginBottom: 16 }}>Définissez la classe de chaque élève pour la rentrée {nextYear}.</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 18 }}>
+        {decisions.map((d) => (
+          <div key={d.studentId} style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 8 }}>{d.name} <span style={{ fontWeight: 500, color: "#8a7f68" }}>· actuellement {d.currentCls}</span></div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <select style={{ ...inputStyle, flex: 1 }} value={d.status} onChange={(e) => update(d.studentId, "status", e.target.value)}>{STATUTS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}</select>
+              <select style={{ ...inputStyle, flex: 1 }} disabled={d.status === "sorti"} value={d.cls} onChange={(e) => update(d.studentId, "cls", e.target.value)}>{DEFAULT_CLASSES.map((c) => <option key={c}>{c}</option>)}</select>
+            </div>
+          </div>
+        ))}
+        {decisions.length === 0 && <EmptyNote text="Aucun élève actif à faire passer." />}
+      </div>
+      {decisions.length > 0 && <Button full onClick={() => { if (confirm(`Ouvrir l'année ${nextYear} ?`)) onValidate(nextYear, decisions); }}>Valider et ouvrir {nextYear}</Button>}
+    </div>
+  );
+}
+
+/* ---------- Personnel ---------- */
+function Personnel({ role, staff, staffSubjects, staffClasses, staffPayments, classNameById, onOpen, onAdd, notify }) {
+  const [showForm, setShowForm] = useState(false); const [filter, setFilter] = useState(""); const [form, setForm] = useState(blank());
+  function blank() { return { name: "", role: "Enseignant", employment_type: "permanent", contact: "", subjects: [], classesSel: [], monthly_salary: "", hourly_rate: "", est_hours: "" }; }
+  const toggleIn = (arr, val) => (arr.includes(val) ? arr.filter((x) => x !== val) : [...arr, val]);
+  const submit = () => { if (!form.name.trim()) return notify("Le nom est requis", true); onAdd({ ...form, name: form.name.trim() }); setForm(blank()); setShowForm(false); };
+  const list = staff.filter((s) => s.name.toLowerCase().includes(filter.toLowerCase()) || s.role.toLowerCase().includes(filter.toLowerCase()));
+  const currentMonthKey = today().slice(0, 7);
+  const lastPaidMonth = (id) => { const ps = staffPayments.filter((p) => p.staff_id === id).sort((a, b) => (b.month || "").localeCompare(a.month || "")); return ps[0]?.month || null; };
+  return (
+    <div>
+      <SectionTitle eyebrow={`${staff.length} membres`} title="Enseignants & personnel" />
+      <input placeholder="Rechercher…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ ...inputStyle, marginBottom: 12 }} />
+      {!showForm ? <Button variant="amber" full onClick={() => setShowForm(true)}>+ Ajouter un membre du personnel</Button> : (
+        <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+          <Field label="Nom complet"><input style={inputStyle} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}><Field label="Fonction"><select style={inputStyle} value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>{STAFF_ROLES.map((r) => <option key={r}>{r}</option>)}</select></Field></div>
+            <div style={{ flex: 1 }}><Field label="Statut"><select style={inputStyle} value={form.employment_type} onChange={(e) => setForm({ ...form, employment_type: e.target.value })}><option value="permanent">Permanent</option><option value="vacataire">Vacataire</option></select></Field></div>
+          </div>
+          <Field label="Contact"><input style={inputStyle} value={form.contact} onChange={(e) => setForm({ ...form, contact: e.target.value })} /></Field>
+          {form.role === "Enseignant" && (<>
+            <Field label="Matières"><div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>{MATIERES.map((m) => <Chip key={m} active={form.subjects.includes(m)} onClick={() => setForm({ ...form, subjects: toggleIn(form.subjects, m) })}>{m}</Chip>)}</div></Field>
+            <Field label="Classes"><div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>{DEFAULT_CLASSES.map((c) => <Chip key={c} active={form.classesSel.includes(c)} onClick={() => setForm({ ...form, classesSel: toggleIn(form.classesSel, c) })}>{c}</Chip>)}</div></Field>
+          </>)}
+          {form.employment_type === "permanent" ? <Field label="Salaire mensuel indicatif"><input style={inputStyle} type="number" value={form.monthly_salary} onChange={(e) => setForm({ ...form, monthly_salary: e.target.value })} /></Field> : (
+            <div style={{ display: "flex", gap: 10 }}><div style={{ flex: 1 }}><Field label="Taux horaire"><input style={inputStyle} type="number" value={form.hourly_rate} onChange={(e) => setForm({ ...form, hourly_rate: e.target.value })} /></Field></div><div style={{ flex: 1 }}><Field label="Heures/mois"><input style={inputStyle} type="number" value={form.est_hours} onChange={(e) => setForm({ ...form, est_hours: e.target.value })} /></Field></div></div>
+          )}
+          <div style={{ display: "flex", gap: 8 }}><Button onClick={submit}>Enregistrer</Button><Button variant="ghost" onClick={() => { setShowForm(false); setForm(blank()); }}>Annuler</Button></div>
+        </div>
+      )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {list.map((s) => { const paid = lastPaidMonth(s.id) === currentMonthKey; return (
+          <button key={s.id} onClick={() => onOpen(s.id)} style={{ textAlign: "left", background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "center", gap: 12, cursor: "pointer", fontFamily: "inherit" }}>
+            <Avatar photo={null} name={s.name} />
+            <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 700, fontSize: 14.5 }}>{s.name}</div><div style={{ fontSize: 12, color: "#8a7f68" }}>{s.role} · {s.employment_type === "permanent" ? "Permanent" : "Vacataire"}</div></div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: paid ? C.forest : "#a89d80" }}>{paid ? "Payé ce mois" : "—"}</div>
+          </button>
+        ); })}
+        {list.length === 0 && <EmptyNote text="Aucun membre du personnel enregistré." />}
+      </div>
+    </div>
+  );
+}
+function StaffFile({ person, subjects, classesSel, role, payments, onClose, onPay }) {
+  const [month, setMonth] = useState(today().slice(0, 7)); const [amount, setAmount] = useState("");
+  if (!person) return null;
+  const indicative = person.employment_type === "permanent" ? Number(person.monthly_salary) || 0 : (Number(person.hourly_rate) || 0) * (Number(person.est_hours) || 0);
+  const submit = () => { if (!amount || Number(amount) <= 0) return; onPay({ month, amount: Number(amount) }); setAmount(""); };
+  return (
+    <Modal title="Fiche du personnel" onClose={onClose}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 18 }}><Avatar photo={null} name={person.name} /><div><div style={{ fontWeight: 800, fontSize: 17, fontFamily: "ui-serif, Georgia, serif" }}>{person.name}</div><div style={{ fontSize: 12.5, color: "#8a7f68" }}>{person.role} · {person.employment_type === "permanent" ? "Permanent" : "Vacataire"}</div></div></div>
+      <InfoRow label="Contact" value={person.contact} />
+      {subjects.length > 0 && <InfoRow label="Matières" value={subjects.join(", ")} />}
+      {classesSel.length > 0 && <InfoRow label="Classes" value={classesSel.join(", ")} />}
+      <InfoRow label="Rémunération" value={person.employment_type === "permanent" ? `${money(person.monthly_salary)} / mois` : `${money(person.hourly_rate)}/h × ${person.est_hours || 0}h ≈ ${money(indicative)}/mois`} />
+      <div style={{ marginTop: 20, marginBottom: 8, fontSize: 13, fontWeight: 700, color: C.forest, textTransform: "uppercase" }}>Suivi indicatif des paiements</div>
+      {role === "directeur" && <div style={{ display: "flex", gap: 8, marginBottom: 12 }}><input style={{ ...inputStyle, flex: 1 }} type="month" value={month} onChange={(e) => setMonth(e.target.value)} /><input style={{ ...inputStyle, flex: 1 }} type="number" placeholder="Montant" value={amount} onChange={(e) => setAmount(e.target.value)} /><Button onClick={submit}>OK</Button></div>}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {payments.sort((a, b) => b.month.localeCompare(a.month)).map((p) => (<div key={p.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: "9px 13px" }}><span>{p.month}</span><span style={{ fontWeight: 700, color: C.forest }}>{money(p.amount)}</span></div>))}
+        {payments.length === 0 && <div style={{ fontSize: 12.5, color: "#a89d80" }}>Aucun paiement indicatif enregistré.</div>}
+      </div>
+      <div style={{ fontSize: 11, color: "#a89d80", marginTop: 12 }}>Ce suivi est indicatif — il ne remplace pas la comptabilité officielle des salaires.</div>
+    </Modal>
+  );
+}
+
+try {
+  ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+} catch (err) {
+  document.getElementById("debug").textContent = "ERREUR AU DÉMARRAGE : " + err.message + "\n" + err.stack;
+}
+</script>
+</body>
+</html>
